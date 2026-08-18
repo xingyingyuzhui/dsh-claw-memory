@@ -88,6 +88,7 @@ test('official sessions get a desensitized brief; Claw sessions do not', async (
 })
 
 test('pre-execute denies memory outside DSclaw', async () => {
+  _internal.setDshHome(process.env.DSH_HOME || join(process.env.HOME || '/Users/qin', '.dsh'))
   let pre
   apply({
     systemPrompt: { section() { return () => {} } },

@@ -46,12 +46,19 @@ export function transcriptOf(events, maxChars) {
   return joined.length > cap ? joined.slice(joined.length - cap) : joined
 }
 
-export function shouldReview(opts) {
+export function reviewSkipReason(opts) {
   const o = opts || {}
-  if (o.reviewEnabled === false) return false
-  if (o.force) return true
-  if (o.isChild) return false
-  if (o.memoryCalled) return false
-  if ((o.turnChars || 0) < 80) return false
-  return true
+  if (o.reviewEnabled === false) return 'review_disabled'
+  if (o.force) return ''
+  if (o.isChild) return 'child_session'
+  if (o.memoryCalled) return 'memory_called'
+  if ((o.turnChars || 0) < 80) return 'turn_too_short'
+  if (Number.isFinite(Number(o.minTurns)) && Number(o.minTurns) > 1) {
+    if ((Number(o.turnCount) || 0) < Number(o.minTurns)) return 'min_turns'
+  }
+  return ''
+}
+
+export function shouldReview(opts) {
+  return reviewSkipReason(opts) === ''
 }

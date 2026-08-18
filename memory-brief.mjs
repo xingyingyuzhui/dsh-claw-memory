@@ -47,6 +47,7 @@ export function loadMainBriefs(home) {
   }
   const rows = []
   for (const agent of Object.values((registry && registry.agents) || {})) {
+    if (rows.length >= BRIEF_LIMITS.maxAgents) break
     if (!agent || agent.status === 'archived' || !agent.canonicalRoot) continue
     let memoryText = ''
     try {

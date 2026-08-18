@@ -1,8 +1,9 @@
-import { realpathSync } from 'node:fs'
 import { applyVaultOp, appendNote, defaultDshHome, listPending, loadDaily, loadDailySync, loadSettings, loadSettingsSync, loadVault, loadVaultSync, removePending, saveDaily, saveRawVault, saveSettings, settingsFile, writePending } from './memory-store.mjs'
+import { isDsClawPath } from '../dsh-agent-identity/identity-files.mjs'
+import { CODES, currentTraceId, operation, runWithTrace, setObserveHome } from '../dsh-observability/observe.mjs'
 import { renderFrozenPrompt } from './memory-prompt.mjs'
 import { loadMainBriefs, renderMainMemoryBrief } from './memory-brief.mjs'
-import { parseReviewJson, reviewSystemPrompt, shouldReview, transcriptOf } from './memory-review.mjs'
+import { parseReviewJson, reviewSkipReason, reviewSystemPrompt, transcriptOf } from './memory-review.mjs'
 
 export const name = 'dsh-agent-memory'
 export const inject = ['tools', 'systemPrompt', 'webServer']
@@ -19,15 +20,11 @@ function optionalService(ctx, key) {
 
 const BODY_CAP = 65536
 const LOOPBACK_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/
+const REVIEW_TIMEOUT_MS = 12000
+const REVIEWED_CAP = 64
 
-function isDsClawPath(path) {
-  const raw = String(path || '').replace(/\\/g, '/')
-  if (/(^|\/)DSclaw(\/|$)/.test(raw)) return true
-  try {
-    return /(^|\/)DSclaw(\/|$)/.test(realpathSync(path).replace(/\\/g, '/'))
-  } catch {
-    return false
-  }
+function clawPath(path) {
+  return isDsClawPath(path, dshHome)
 }
 
 function cwdOf(agent) {
@@ -40,17 +37,57 @@ let dshHome = defaultDshHome()
 const snapshots = new Map()
 const called = new Set()
 const reviewed = new Set()
+let briefCache = { at: 0, text: '' }
 
 const _internal = {
-  setDshHome(dir) { dshHome = dir },
+  setDshHome(dir) {
+    dshHome = dir
+    briefCache = { at: 0, text: '' }
+    setObserveHome(dir)
+  },
   getDshHome() { return dshHome },
   snapshots,
 }
 export { _internal }
 
+function turnKey(agent, session) {
+  const id = (agent && agent.id) || ''
+  const seq = (session && session.seq) || (agent && agent.session && agent.session.seq) || 'turn'
+  return id + ':' + seq
+}
+
+function markReviewed(mark) {
+  if (reviewed.has(mark)) return true
+  reviewed.add(mark)
+  while (reviewed.size > REVIEWED_CAP) {
+    const first = reviewed.values().next().value
+    reviewed.delete(first)
+  }
+  return false
+}
+
+function withTimeout(promise, ms) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('memory review timeout')), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+function mainBriefText() {
+  const now = Date.now()
+  if (briefCache.text && now - briefCache.at < 15000) return briefCache.text
+  briefCache = { at: now, text: renderMainMemoryBrief(loadMainBriefs(dshHome)) }
+  return briefCache.text
+}
+
 const writeJson = (res, status, body) => {
+  const traceId = currentTraceId()
+  const payload = body && typeof body === 'object' && traceId && body.traceId == null
+    ? { ...body, traceId }
+    : body
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-  res.end(JSON.stringify(body))
+  res.end(JSON.stringify(payload))
 }
 
 const readJsonBody = (req, cap = BODY_CAP) => new Promise((resolveBody, reject) => {
@@ -137,32 +174,61 @@ function agentForSession(ctx, session) {
 
 async function runOp(root, op, settings) {
   const action = op.action
-  if (action === 'save' && (op.target === 'daily' || op.target === 'note')) {
-    return saveDaily(root, op.key, op.content)
+  const tracked = action === 'add' || action === 'replace' || action === 'remove' || action === 'approve' || action === 'reject' || action === 'save' || action === 'note'
+  const obs = tracked
+    ? operation({ plugin: 'dsh-agent-memory', feature: 'vault', operation: 'memory_' + String(action || 'op') })
+    : null
+  if (obs) obs.start()
+  try {
+    if (action === 'save' && (op.target === 'daily' || op.target === 'note')) {
+      const saved = await saveDaily(root, op.key, op.content)
+      if (obs) saved && saved.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, saved.error) : obs.success()
+      return saved
+    }
+    if (action === 'save') {
+      const saved = await saveRawVault(root, op.target || 'memory', op.content)
+      if (obs) saved && saved.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, saved.error) : obs.success()
+      return saved
+    }
+    if (action === 'note') {
+      const saved = await appendNote(root, op.content)
+      if (obs) saved && saved.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, saved.error) : obs.success()
+      return saved
+    }
+    if (action === 'pending') return { ok: true, pending: await listPending(root) }
+    if (action === 'approve') {
+      const rows = await listPending(root)
+      const row = rows.find((item) => item.id === op.id)
+      if (!row) {
+        if (obs) obs.reject(CODES.MEMORY_PENDING_NOT_FOUND)
+        return { ok: false, error: 'pending id not found', code: CODES.MEMORY_PENDING_NOT_FOUND }
+      }
+      const applied = row.action === 'note'
+        ? await appendNote(root, row.content)
+        : await applyVaultOp(root, row.action, row.target, row.content, row.old_text)
+      if (applied.ok) await removePending(root, row.id)
+      if (obs) applied.ok ? obs.success() : obs.fail(CODES.MEMORY_WRITE_FAILED, applied.error)
+      return applied
+    }
+    if (action === 'reject') {
+      const ok = await removePending(root, op.id)
+      if (!ok && obs) obs.reject(CODES.MEMORY_PENDING_ID_INVALID)
+      else if (obs) obs.success()
+      return { ok, error: ok ? undefined : 'pending id not found', code: ok ? undefined : CODES.MEMORY_PENDING_ID_INVALID }
+    }
+    const approval = settings && settings.writeApproval
+    if (approval && (action === 'add' || action === 'replace' || action === 'remove' || action === 'note')) {
+      const row = await writePending(root, op)
+      if (obs) obs.success({ code: 'MEMORY_PENDING_QUEUED' })
+      return { ok: true, pending: true, id: row.id }
+    }
+    const written = await applyVaultOp(root, action, op.target || 'memory', op.content, op.old_text)
+    if (obs) written && written.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, written.error) : obs.success()
+    return written
+  } catch (error) {
+    if (obs && !obs.finished) obs.fail(CODES.MEMORY_WRITE_FAILED, error, { state: 'clean' })
+    throw error
   }
-  if (action === 'save') return saveRawVault(root, op.target || 'memory', op.content)
-  if (action === 'note') return appendNote(root, op.content)
-  if (action === 'pending') return { ok: true, pending: await listPending(root) }
-  if (action === 'approve') {
-    const rows = await listPending(root)
-    const row = rows.find((item) => item.id === op.id)
-    if (!row) return { ok: false, error: 'pending id not found' }
-    const applied = row.action === 'note'
-      ? await appendNote(root, row.content)
-      : await applyVaultOp(root, row.action, row.target, row.content, row.old_text)
-    if (applied.ok) await removePending(root, row.id)
-    return applied
-  }
-  if (action === 'reject') {
-    const ok = await removePending(root, op.id)
-    return { ok, error: ok ? undefined : 'pending id not found' }
-  }
-  const approval = settings && settings.writeApproval
-  if (approval && (action === 'add' || action === 'replace' || action === 'remove' || action === 'note')) {
-    const row = await writePending(root, op)
-    return { ok: true, pending: true, id: row.id }
-  }
-  return applyVaultOp(root, action, op.target || 'memory', op.content, op.old_text)
 }
 
 function toolResult(value) {
@@ -189,7 +255,7 @@ export function apply(ctx) {
     text: (assemble) => {
       const agent = assemble && assemble.agent
       const cwd = cwdOf(agent)
-      if (!isDsClawPath(cwd)) return ''
+      if (!clawPath(cwd)) return ''
       const id = agent && agent.id
       if (id && snapshots.has(id)) return snapshots.get(id)
       const text = renderFrozenPrompt(
@@ -207,8 +273,8 @@ export function apply(ctx) {
     order: 17,
     text: (assemble) => {
       const cwd = cwdOf(assemble && assemble.agent)
-      if (isDsClawPath(cwd)) return ''
-      return renderMainMemoryBrief(loadMainBriefs(dshHome))
+      if (clawPath(cwd)) return ''
+      return mainBriefText()
     },
   })
 
@@ -233,13 +299,13 @@ export function apply(ctx) {
       async execute(args, exec) {
         const agent = exec && exec.agent
         const cwd = cwdOf(agent) || root
-        if (!isDsClawPath(cwd)) {
+        if (!clawPath(cwd)) {
           return toolResult({ ok: false, error: 'memory is only available to Claw agents' })
         }
         const settings = loadSettingsSync(settingsPath())
         const result = await runOp(cwd, args || {}, settings)
-        const id = sessionId || (agent && agent.id)
-        if (result && result.ok && id) called.add(id)
+        const key = turnKey(agent, agent && agent.session) || sessionId
+        if (result && result.ok && key) called.add(key)
         return toolResult(result)
       },
     }
@@ -247,7 +313,7 @@ export function apply(ctx) {
 
   function mountTool(agent) {
     const cwd = cwdOf(agent)
-    if (!agent || !isDsClawPath(cwd)) return
+    if (!agent || !clawPath(cwd)) return
     const tools = agent.ctx && agent.ctx.tools
     if (!tools || typeof tools.register !== 'function') return
     try { tools.register(memoryTool(cwd, agent.id)) } catch { /* already registered */ }
@@ -272,37 +338,77 @@ export function apply(ctx) {
     const opts = flags || {}
     const events = session && session.events
     const text = transcriptOf(events)
-    if (!shouldReview({
+    const key = turnKey(agent, session)
+    const op = operation({
+      plugin: 'dsh-agent-memory',
+      feature: 'review',
+      operation: opts.force ? 'compaction_flush' : 'turn_review',
+      sessionId: session && session.id,
+    })
+    op.start()
+    const skip = reviewSkipReason({
       reviewEnabled: settings.review.enabled,
       isChild: Boolean(opts.isChild),
-      memoryCalled: Boolean(agent && agent.id && called.has(agent.id)),
+      memoryCalled: Boolean(key && called.has(key)),
       turnChars: text.length,
+      turnCount: Number(session && session.seq) || 0,
+      minTurns: settings.review.minTurns,
       force: Boolean(opts.force),
-    })) return
-    const mark = ((agent && agent.id) || cwd) + ':' + (opts.mark || (session && session.seq) || 'flush')
-    if (reviewed.has(mark)) return
-    reviewed.add(mark)
-    const runtime = llm
-    if (!runtime || typeof runtime.stream !== 'function') return
-    const route = resolveRoute(agent, session)
-    if (!route) return
-    const chunks = []
-    for await (const chunk of runtime.stream({
-      provider: route.provider,
-      model: route.model,
-      system: reviewSystemPrompt(),
-      messages: [{
-        id: 'review',
-        role: 'user',
-        content: [{ type: 'text', text: text }],
-        source: { kind: 'user' },
-      }],
-      maxTokens: 600,
-    })) {
-      if (chunk && chunk.type === 'text-delta' && chunk.text) chunks.push(chunk.text)
+    })
+    if (skip) {
+      op.degraded(CODES.MEMORY_REVIEW_SKIPPED, { skipReason: skip })
+      return
     }
-    await applyReviewOps(cwd, parseReviewJson(chunks.join('')), settings)
-    if (agent && agent.id) called.delete(agent.id)
+    const mark = ((agent && agent.id) || cwd) + ':' + (opts.mark || (session && session.seq) || 'flush')
+    if (markReviewed(mark)) {
+      op.degraded(CODES.MEMORY_REVIEW_SKIPPED, { skipReason: 'already_reviewed' })
+      return
+    }
+    if (opts.signal && opts.signal.aborted) {
+      op.degraded(CODES.MEMORY_REVIEW_SKIPPED, { skipReason: 'aborted' })
+      return
+    }
+    const runtime = llm
+    if (!runtime || typeof runtime.stream !== 'function') {
+      op.degraded(CODES.MEMORY_REVIEW_LLM_FAILED, { skipReason: 'llm_unavailable' })
+      return
+    }
+    const route = resolveRoute(agent, session)
+    if (!route) {
+      op.degraded(CODES.MEMORY_REVIEW_LLM_FAILED, { skipReason: 'no_route' })
+      return
+    }
+    op.stage('llm_review')
+    try {
+      const chunks = []
+      for await (const chunk of runtime.stream({
+        provider: route.provider,
+        model: route.model,
+        system: reviewSystemPrompt(),
+        messages: [{
+          id: 'review',
+          role: 'user',
+          content: [{ type: 'text', text: text }],
+          source: { kind: 'user' },
+        }],
+        maxTokens: 600,
+      })) {
+        if (opts.signal && opts.signal.aborted) {
+          op.degraded(CODES.MEMORY_REVIEW_SKIPPED, { skipReason: 'aborted' })
+          return
+        }
+        if (chunk && chunk.type === 'text-delta' && chunk.text) chunks.push(chunk.text)
+      }
+      op.stage('apply_ops')
+      await applyReviewOps(cwd, parseReviewJson(chunks.join('')), settings)
+      if (key) called.delete(key)
+      op.success()
+    } catch (error) {
+      const code = String(error && error.message || '').indexOf('timeout') >= 0
+        ? CODES.MEMORY_FLUSH_TIMEOUT
+        : CODES.MEMORY_REVIEW_LLM_FAILED
+      if (!op.finished) op.fail(code, error, { state: 'clean' })
+    }
   }
 
   const onCreated = ctx.on && ctx.on('agent/created', (payload) => {
@@ -312,7 +418,7 @@ export function apply(ctx) {
   const onStart = ctx.on && ctx.on('agent/session-start', (payload) => {
     const agent = payload && (payload.agent || payload)
     const cwd = cwdOf(agent)
-    if (!agent || !isDsClawPath(cwd)) return
+    if (!agent || !clawPath(cwd)) return
     mountTool(agent)
     snapshotOf(cwd).then((text) => {
       if (agent.id) snapshots.set(agent.id, text)
@@ -328,18 +434,22 @@ export function apply(ctx) {
     const toolName = event && (event.name || (event.execution && event.execution.name))
     if (toolName !== 'memory') return next()
     const agent = event && (event.agent || (event.execution && event.execution.agent))
-    if (!isDsClawPath(cwdOf(agent))) return { kind: 'deny', reason: 'memory is only available to Claw agents' }
+    if (!clawPath(cwdOf(agent))) return { kind: 'deny', reason: 'memory is only available to Claw agents' }
     return { kind: 'allow' }
   })
 
-  const stopStop = ctx.on && ctx.on('agent/turn-stopping', async (payload) => {
+  const stopStop = ctx.on && ctx.on('agent/turn-stopping', (payload) => {
     try {
       const agent = payload && payload.agent
       const cwd = cwdOf(agent)
-      if (!agent || !isDsClawPath(cwd)) return
+      if (!agent || !clawPath(cwd)) return
       const settings = loadSettingsSync(settingsPath())
-      await reviewSession(agent, agent.session, cwd, settings, {
+      const key = turnKey(agent, agent.session)
+      void reviewSession(agent, agent.session, cwd, settings, {
         isChild: Boolean(payload && payload.parent),
+        signal: payload && payload.signal,
+      }).catch(() => {}).finally(() => {
+        if (key) called.delete(key)
       })
     } catch { /* review must never fail the user turn */ }
   })
@@ -348,17 +458,17 @@ export function apply(ctx) {
     try {
       if (!event || event.type !== 'compaction/start') return
       const cwd = session && session.header && session.header.cwd
-      if (!isDsClawPath(cwd)) return
+      if (!clawPath(cwd)) return
       const settings = loadSettingsSync(settingsPath())
       const agent = agentForSession(ctx, session)
-      void reviewSession(agent, session, cwd, settings, {
+      return withTimeout(reviewSession(agent, session, cwd, settings, {
         force: true,
         mark: 'compaction:' + (event.data && event.data.compactionId || event.seq || ''),
-      }).catch(() => {})
+      }), REVIEW_TIMEOUT_MS).catch(() => {})
     } catch { /* flush must never fail compaction */ }
   })
 
-  const handle = (fn) => async (req, res) => {
+  const handle = (fn) => async (req, res) => runWithTrace(req, async () => {
     if (!guard(req, res)) return
     try {
       const body = await readJsonBody(req)
@@ -366,7 +476,7 @@ export function apply(ctx) {
     } catch (error) {
       writeJson(res, 400, { ok: false, error: String(error && error.message || error) })
     }
-  }
+  })
 
   const routes = [
     ctx.webServer.register({
@@ -374,7 +484,7 @@ export function apply(ctx) {
       path: '/dsh-agent-memory/read',
       handler: handle(async (_req, res, body) => {
         const root = body && body.root
-        if (!isDsClawPath(root)) {
+        if (!clawPath(root)) {
           writeJson(res, 400, { ok: false, error: 'invalid root' })
           return
         }
@@ -391,8 +501,11 @@ export function apply(ctx) {
       path: '/dsh-agent-memory/write',
       handler: handle(async (_req, res, body) => {
         const root = body && body.root
-        if (!isDsClawPath(root)) {
-          writeJson(res, 400, { ok: false, error: 'invalid root' })
+        if (!clawPath(root)) {
+          const op = operation({ plugin: 'dsh-agent-memory', feature: 'vault', operation: 'memory_write' })
+          op.start()
+          op.reject(CODES.MEMORY_ROOT_INVALID)
+          writeJson(res, 400, { ok: false, error: 'invalid root', code: CODES.MEMORY_ROOT_INVALID })
           return
         }
         const settings = loadSettingsSync(settingsPath())

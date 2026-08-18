@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { LIMITS, addEntry, joinEntries, removeEntry, replaceEntry, splitEntries, usageOf } from './memory-entries.mjs'
@@ -44,8 +44,7 @@ export async function loadSettings(file) {
 
 export async function saveSettings(file, value) {
   const next = normalizeSettings(value)
-  await mkdir(dirname(file), { recursive: true })
-  await writeFile(file, JSON.stringify(next, null, 2) + '\n')
+  await enqueueWrite(file, () => atomicWrite(file, JSON.stringify(next, null, 2) + '\n'))
   return next
 }
 
@@ -67,6 +66,26 @@ export function pendingDir(root) {
   return join(noteDir(root), '.pending')
 }
 
+export const PENDING_ID = /^[a-f0-9]{8}$/
+
+const writeQueues = new Map()
+
+export function enqueueWrite(key, fn) {
+  const prev = writeQueues.get(key) || Promise.resolve()
+  const next = prev.then(fn, fn)
+  writeQueues.set(key, next.then(() => {}, () => {}))
+  return next
+}
+
+export function pendingFile(root, id) {
+  if (!PENDING_ID.test(String(id || ''))) return ''
+  const dir = resolve(pendingDir(root))
+  const target = resolve(dir, id + '.json')
+  const rel = relative(dir, target)
+  if (!rel || rel.startsWith('..') || rel.startsWith('/')) return ''
+  return target
+}
+
 export function dateKey(now = new Date()) {
   const stamp = now instanceof Date ? now : new Date(now)
   const y = stamp.getFullYear()
@@ -83,14 +102,15 @@ export function yesterdayKey(now = new Date()) {
 async function readText(path) {
   try {
     return await readFile(path, 'utf8')
-  } catch {
-    return ''
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return ''
+    throw error
   }
 }
 
 export async function atomicWrite(path, text) {
   await mkdir(dirname(path), { recursive: true })
-  const tmp = path + '.' + randomUUID() + '.tmp'
+  const tmp = path + '.' + process.pid + '.' + randomUUID() + '.tmp'
   await writeFile(tmp, text)
   await rename(tmp, path)
 }
@@ -134,7 +154,7 @@ export async function saveVault(root, target, entries) {
   const path = vaultPath(root, target)
   const text = joinEntries(entries)
   const suffix = text && !text.endsWith('\n') ? '\n' : ''
-  await atomicWrite(path, text + suffix)
+  await enqueueWrite(path, () => atomicWrite(path, text + suffix))
   return loadVault(root, target)
 }
 
@@ -156,16 +176,22 @@ export async function applyVaultOp(root, action, target, content, oldText) {
     const scan = scanMemoryText(content || '')
     if (scan) return { ok: false, error: scan }
   }
-  const vault = await loadVault(root, target)
-  let result
-  if (action === 'add') result = addEntry(vault.entries, content, vault.limit)
-  else if (action === 'replace') result = replaceEntry(vault.entries, oldText, content, vault.limit)
-  else if (action === 'remove') result = removeEntry(vault.entries, oldText, vault.limit)
-  else return { ok: false, error: 'unknown action' }
-  if (!result.ok) return result
-  if (result.duplicate) return { ok: true, duplicate: true, target, ...result, path: vault.path }
-  const saved = await saveVault(root, target, result.entries)
-  return { ok: true, target, entries: saved.entries, usage: saved.usage, path: saved.path }
+  const path = vaultPath(root, target)
+  return enqueueWrite(path, async () => {
+    const vault = await loadVault(root, target)
+    let result
+    if (action === 'add') result = addEntry(vault.entries, content, vault.limit)
+    else if (action === 'replace') result = replaceEntry(vault.entries, oldText, content, vault.limit)
+    else if (action === 'remove') result = removeEntry(vault.entries, oldText, vault.limit)
+    else return { ok: false, error: 'unknown action' }
+    if (!result.ok) return result
+    if (result.duplicate) return { ok: true, duplicate: true, target, ...result, path: vault.path }
+    const text = joinEntries(result.entries)
+    const suffix = text && !text.endsWith('\n') ? '\n' : ''
+    await atomicWrite(path, text + suffix)
+    const saved = await loadVault(root, target)
+    return { ok: true, target, entries: saved.entries, usage: saved.usage, path: saved.path }
+  })
 }
 
 export async function saveDaily(root, key, text, now = new Date()) {
@@ -182,7 +208,7 @@ export async function saveDaily(root, key, text, now = new Date()) {
   if (next.length > LIMITS.note) {
     return { ok: false, error: 'Daily note at limit (' + next.length + '/' + LIMITS.note + ').' }
   }
-  await atomicWrite(path, next)
+  await enqueueWrite(path, () => atomicWrite(path, next))
   return { ok: true, target: 'daily', key: stamp, path, text: next }
 }
 
@@ -193,13 +219,15 @@ export async function appendNote(root, content, now = new Date()) {
   if (!note) return { ok: false, error: 'content required' }
   const key = dateKey(now)
   const path = notePath(root, key)
-  const prev = await readText(path)
-  const next = (prev && !prev.endsWith('\n') ? prev + '\n' : prev) + note + '\n'
-  if (next.length > LIMITS.note) {
-    return { ok: false, error: 'Daily note at limit (' + prev.length + '/' + LIMITS.note + ').' }
-  }
-  await atomicWrite(path, next)
-  return { ok: true, target: 'note', path, key, text: next }
+  return enqueueWrite(path, async () => {
+    const prev = await readText(path)
+    const next = (prev && !prev.endsWith('\n') ? prev + '\n' : prev) + note + '\n'
+    if (next.length > LIMITS.note) {
+      return { ok: false, error: 'Daily note at limit (' + prev.length + '/' + LIMITS.note + ').' }
+    }
+    await atomicWrite(path, next)
+    return { ok: true, target: 'note', path, key, text: next }
+  })
 }
 
 export async function loadDaily(root, now = new Date()) {
@@ -243,8 +271,10 @@ export async function listPending(root) {
 
 export async function removePending(root, id) {
   const { unlink } = await import('node:fs/promises')
+  const path = pendingFile(root, id)
+  if (!path) return false
   try {
-    await unlink(join(pendingDir(root), id + '.json'))
+    await unlink(path)
     return true
   } catch {
     return false

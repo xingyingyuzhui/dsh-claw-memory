@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { parseReviewJson, shouldReview, transcriptOf } from '../memory-review.mjs'
+import { parseReviewJson, reviewSkipReason, shouldReview, transcriptOf } from '../memory-review.mjs'
 
 test('review json parser is tolerant', () => {
   const ops = parseReviewJson('sure\n{"add":[{"target":"user","content":"prefers zh"}],"note":["shipped"]}\n')
@@ -16,6 +16,10 @@ test('review skips children, empty turns, and turns that already wrote memory', 
   assert.equal(shouldReview({ turnChars: 200 }), true)
   assert.equal(shouldReview({ force: true, memoryCalled: true, turnChars: 10 }), true)
   assert.equal(shouldReview({ force: true, reviewEnabled: false }), false)
+  assert.equal(shouldReview({ turnChars: 200, minTurns: 3, turnCount: 1 }), false)
+  assert.equal(shouldReview({ turnChars: 200, minTurns: 3, turnCount: 3 }), true)
+  assert.equal(reviewSkipReason({ memoryCalled: true, turnChars: 200 }), 'memory_called')
+  assert.equal(reviewSkipReason({ isChild: true, turnChars: 200 }), 'child_session')
 })
 
 test('transcript skips heartbeat lines', () => {
