@@ -1,0 +1,4 @@
+# dsh bundle layer: Claw persistent memory vault and review.
+- insert:
+    - id: dsh-agent-memory
+      name: dsh-agent-memory
