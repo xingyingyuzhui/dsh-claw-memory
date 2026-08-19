@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { escapesHome } from '../dsh-session-permissions/perm-path.mjs'
 import { randomUUID } from 'node:crypto'
 import { LIMITS, addEntry, joinEntries, removeEntry, replaceEntry, splitEntries, usageOf } from './memory-entries.mjs'
 import { scanMemoryText } from './memory-scan.mjs'
@@ -82,7 +83,7 @@ export function pendingFile(root, id) {
   const dir = resolve(pendingDir(root))
   const target = resolve(dir, id + '.json')
   const rel = relative(dir, target)
-  if (!rel || rel.startsWith('..') || rel.startsWith('/')) return ''
+  if (!rel || escapesHome(rel)) return ''
   return target
 }
 

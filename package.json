@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-memory",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Claw persistent memory: vault, daily notes, review, flush. 完整留存：金库、日记、回顾、压缩前冲洗。",
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "agent", "memory"],
   "license": "MIT",
