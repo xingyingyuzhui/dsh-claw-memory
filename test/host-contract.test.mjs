@@ -89,7 +89,7 @@ test('apply registers prompt, routes, and disposes', () => {
   if (typeof stop === 'function') stop()
 })
 
-test('official sessions get a desensitized brief; Claw sessions do not', async () => {
+test('workspace sessions do not receive Claw memory briefs', async () => {
   const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')
   const home = await mkdtemp(join(tmpdir(), 'mem-main-'))
@@ -118,8 +118,7 @@ test('official sessions get a desensitized brief; Claw sessions do not', async (
   const brief = sections.find((row) => row.name === 'dsh-agent-memory-brief')
   const official = brief.text({ agent: { session: { header: { cwd: join(home, 'project') } } } })
   const claw = brief.text({ agent: { session: { header: { cwd: root } } } })
-  assert.match(official, /alpha/)
-  assert.match(official, /worktrees/)
+  assert.equal(official, '')
   assert.equal(claw, '')
 })
 

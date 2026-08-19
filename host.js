@@ -271,10 +271,8 @@ export function apply(ctx) {
   const stopBrief = ctx.systemPrompt.section({
     name: 'dsh-agent-memory-brief',
     order: 17,
-    text: (assemble) => {
-      const cwd = cwdOf(assemble && assemble.agent)
-      if (clawPath(cwd)) return ''
-      return mainBriefText()
+    text() {
+      return ''
     },
   })
 

@@ -5,7 +5,7 @@
 - `memory` 工具只挂在 Claw 会话上（`agent/created` + `agent/session-start`）
 - 回合结束后按设置做回顾；压缩开始时听官方 `session/event` 的 `compaction/start`，立刻把该写入金库
 - 设置：自由写或需审批、回顾开关。待审批项在 Claw Agent → 记忆 tab
-- 官方 / Main 会话只注入各 Claw Agent 的脱敏 MEMORY 摘要，不含 SOUL、凭据、工具原文
+- 工作区 / 官方会话不注入 Claw 记忆。Claw 会话只读自己的金库。
 
 ## 安装
 
