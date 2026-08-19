@@ -284,11 +284,19 @@ export function apply(ctx) {
       description: 'Persist durable Claw memory. target=user for preferences, target=memory for environment and lessons. Use note for daily process. Full vaults must be consolidated before add.',
       timeoutMs: 8000,
       parameters: {
-        action: { type: 'string', required: true, description: 'add | replace | remove | note | pending | approve | reject' },
-        target: { type: 'string', description: 'user or memory' },
-        content: { type: 'string', description: 'Entry text for add/replace/note' },
-        old_text: { type: 'string', description: 'Unique substring for replace/remove' },
-        id: { type: 'string', description: 'Pending id for approve/reject' },
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['add', 'replace', 'remove', 'note', 'pending', 'approve', 'reject'],
+            description: 'add | replace | remove | note | pending | approve | reject',
+          },
+          target: { type: 'string', enum: ['user', 'memory'], description: 'user or memory' },
+          content: { type: 'string', description: 'Entry text for add/replace/note' },
+          old_text: { type: 'string', description: 'Unique substring for replace/remove' },
+          id: { type: 'string', description: 'Pending id for approve/reject' },
+        },
+        required: ['action'],
       },
       output: {
         schema: { type: 'object' },

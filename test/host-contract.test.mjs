@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apply, inject, name, _internal } from '../host.js'
@@ -11,6 +12,41 @@ test('host named exports', () => {
   assert.equal(name, 'dsh-agent-memory')
   assert.deepEqual(inject, ['tools', 'systemPrompt', 'webServer'])
   assert.doesNotMatch(hostSrc, /ctx\.llm/)
+})
+
+test('memory tool parameters are a JSON Schema object', () => {
+  const home = join(tmpdir(), 'mem-schema-home')
+  _internal.setDshHome(home)
+  let registered
+  apply({
+    systemPrompt: { section() { return () => {} } },
+    webServer: { register() { return () => {} } },
+    tools: { register() { return () => {} } },
+    on(name, fn) {
+      if (name === 'agent/created') {
+        fn({
+          agent: {
+            id: 'wa_test',
+            ctx: {
+              tools: {
+                register(def) {
+                  registered = def
+                  return () => {}
+                },
+              },
+            },
+            session: { header: { cwd: join(home, 'DSclaw', 'bot1') } },
+          },
+        })
+      }
+      return () => {}
+    },
+    effect() {},
+  })
+  assert.equal(registered && registered.name, 'memory')
+  assert.equal(registered.parameters.type, 'object')
+  assert.ok(registered.parameters.properties.action)
+  assert.deepEqual(registered.parameters.required, ['action'])
 })
 
 test('apply registers prompt, routes, and disposes', () => {
