@@ -77,7 +77,7 @@ test('apply registers prompt, routes, and disposes', () => {
   apply(ctx)
   assert.deepEqual(sections.map((row) => row.name), ['dsh-agent-memory', 'dsh-agent-memory-brief'])
   assert.ok(events.includes('agent/created'))
-  assert.ok(events.includes('agent/session-start'))
+  assert.ok(!events.includes('agent/session-start'))
   assert.ok(events.includes('agent/turn-stopping'))
   assert.ok(events.includes('session/event'))
   assert.ok(!events.includes('agent/pre-step'))

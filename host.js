@@ -417,18 +417,19 @@ export function apply(ctx) {
     }
   }
 
-  const onCreated = ctx.on && ctx.on('agent/created', (payload) => {
-    mountTool(payload && (payload.agent || payload))
-  })
-
-  const onStart = ctx.on && ctx.on('agent/session-start', (payload) => {
+  // DSH 0.1.6+: agent/created is serial/awaited — mount tools and warm MEMORY.md
+  // before the first model request. Do not also listen for agent/session-start (removed).
+  const onCreated = ctx.on && ctx.on('agent/created', async (payload) => {
     const agent = payload && (payload.agent || payload)
+    mountTool(agent)
     const cwd = cwdOf(agent)
     if (!agent || !clawPath(cwd)) return
-    mountTool(agent)
-    snapshotOf(cwd).then((text) => {
+    try {
+      const text = await snapshotOf(cwd)
       if (agent.id) snapshots.set(agent.id, text)
-    }).catch(() => {})
+    } catch {
+      /* snapshot is best-effort; tool still mounts */
+    }
   })
 
   try {
@@ -540,7 +541,6 @@ export function apply(ctx) {
     if (typeof stopPrompt === 'function') stopPrompt()
     if (typeof stopBrief === 'function') stopBrief()
     if (typeof onCreated === 'function') onCreated()
-    if (typeof onStart === 'function') onStart()
     if (typeof stopPre === 'function') stopPre()
     if (typeof stopStop === 'function') stopStop()
     if (typeof stopFlush === 'function') stopFlush()
