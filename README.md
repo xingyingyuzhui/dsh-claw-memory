@@ -1,4 +1,4 @@
-# dsh-agent-memory · Claw 记忆
+# dsh-claw-memory · Claw 记忆
 
 独立记忆插件。每个 Claw Agent 有 USER / MEMORY 金库、日记和回合后回顾。不拦截其它工具。HEARTBEAT 巡检不在本插件。
 
@@ -10,15 +10,15 @@
 ## 安装
 
 ```sh
-dsh plugin --profile web add github:xingyingyuzhui/dsh-agent-memory
+dsh plugin --profile web add github:xingyingyuzhui/dsh-claw-memory
 ```
 
-建议装在 `dsh-agent-registry` 和 `dsh-agent-identity` 之后。装完重启 `dsh web`。
+建议装在 `dsh-claw-registry` 和 `dsh-claw-identity` 之后。装完重启 `dsh web`。
 
 本地开发：
 
 ```sh
-dsh plugin --profile web add link:/abs/path/to/dsh-agent-memory
+dsh plugin --profile web add link:/abs/path/to/dsh-claw-memory
 ```
 
 ## 数据
