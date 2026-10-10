@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
+import { mkdir as mkdirAsync, mkdtemp as mkdtempAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -146,7 +147,8 @@ test('workspace sessions do not receive Claw memory briefs', async () => {
 })
 
 test('pre-execute denies memory outside DSclaw', async () => {
-  _internal.setDshHome(process.env.DSH_HOME || join(process.env.HOME || '/Users/qin', '.dsh'))
+  const home = join(tmpdir(), `memory-pre-${process.pid}`)
+  _internal.setDshHome(home)
   let pre
   const { connection } = fakeConnection()
   apply({
@@ -166,7 +168,7 @@ test('pre-execute denies memory outside DSclaw', async () => {
   assert.equal(denied.kind, 'deny')
   const allowed = await pre({
     name: 'memory',
-    agent: { session: { header: { cwd: '/Users/qin/.dsh/DSclaw/test1' } } },
+    agent: { session: { header: { cwd: join(home, 'DSclaw', 'test1') } } },
   }, () => ({ kind: 'next' }))
   assert.equal(allowed.kind, 'allow')
 })
@@ -189,4 +191,36 @@ test('memory read rejects invalid root via Connection Fetch', async () => {
   const payload = await res.json()
   assert.equal(payload.ok, false)
   assert.match(payload.error, /invalid root/)
+})
+
+test('corrupt pending entry is skipped on read and recorded as a diagnostic', async () => {
+  const home = await mkdtempAsync(join(tmpdir(), 'mem-corrupt-'))
+  const root = join(home, 'DSclaw', 'alpha')
+  const pending = join(root, 'memory', '.pending')
+  await mkdirAsync(pending, { recursive: true })
+  await writeFileAsync(join(pending, 'aaaaaaaa.json'), '{broken')
+  await writeFileAsync(join(pending, 'bbbbbbbb.json'), JSON.stringify({ id: 'bbbbbbbb', action: 'add', target: 'memory', content: 'ok', at: '2026-01-01T00:00:00.000Z' }))
+  _internal.setDshHome(home)
+  const { connection, routes } = fakeConnection()
+  apply({
+    systemPrompt: { section() { return () => {} } },
+    connection,
+    tools: { register() { return () => {} } },
+    on() { return () => {} },
+    effect() {},
+  })
+  const read = routes.find((row) => row.path === '/api/dsh-claw/memory/read')
+  const res = await read.fetch(new Request('dsh-app://host/api/dsh-claw/memory/read', {
+    method: 'POST',
+    body: JSON.stringify({ root }),
+  }))
+  assert.equal(res.status, 200)
+  const payload = await res.json()
+  assert.deepEqual(payload.pending.map((row) => row.id), ['bbbbbbbb'])
+  const diag = readFileSync(join(home, 'agent-observe', 'diag.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  const hit = diag.find((row) => row.code === 'MEMORY_READ_FAILED')
+  assert.ok(hit)
+  assert.equal(hit.outcome, 'degraded')
+  assert.equal(hit.skipReason, 'corrupt_entry')
+  assert.equal(hit.reason, 'invalid json')
 })

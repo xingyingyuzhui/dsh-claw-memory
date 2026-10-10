@@ -87,6 +87,15 @@ function withTrace(data) {
   return { ...data, traceId }
 }
 
+function reportSkippedPending(skip) {
+  operation({ plugin: 'dsh-claw-memory', feature: 'vault', operation: 'memory_pending_read' })
+    .degraded(CODES.MEMORY_READ_FAILED, { skipReason: 'corrupt_entry', reason: skip && skip.reason })
+}
+
+function pendingOf(root) {
+  return listPending(root, reportSkippedPending)
+}
+
 async function snapshotOf(root) {
   const user = await loadVault(root, 'user')
   const memory = await loadVault(root, 'memory')
@@ -152,9 +161,9 @@ async function runOp(root, op, settings) {
       if (obs) saved && saved.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, saved.error) : obs.success()
       return saved
     }
-    if (action === 'pending') return { ok: true, pending: await listPending(root) }
+    if (action === 'pending') return { ok: true, pending: await pendingOf(root) }
     if (action === 'approve') {
-      const rows = await listPending(root)
+      const rows = await pendingOf(root)
       const row = rows.find((item) => item.id === op.id)
       if (!row) {
         if (obs) obs.reject(CODES.MEMORY_PENDING_NOT_FOUND)
@@ -259,17 +268,19 @@ export function apply(ctx) {
           return [{ type: 'text', text: JSON.stringify(value || {}, null, 2) }]
         },
       },
-      async execute(args, exec) {
-        const agent = exec && exec.agent
-        const cwd = cwdOf(agent) || root
-        if (!clawPath(cwd)) {
-          return toolResult({ ok: false, error: 'memory is only available to Claw agents' })
-        }
-        const settings = loadSettingsSync(settingsPath())
-        const result = await runOp(cwd, args || {}, settings)
-        const key = turnKey(agent, agent && agent.session) || sessionId
-        if (result && result.ok && key) called.add(key)
-        return toolResult(result)
+      execute(args, exec) {
+        return runWithTrace(exec, async () => {
+          const agent = exec && exec.agent
+          const cwd = cwdOf(agent) || root
+          if (!clawPath(cwd)) {
+            return toolResult({ ok: false, error: 'memory is only available to Claw agents' })
+          }
+          const settings = loadSettingsSync(settingsPath())
+          const result = await runOp(cwd, args || {}, settings)
+          const key = turnKey(agent, agent && agent.session) || sessionId
+          if (result && result.ok && key) called.add(key)
+          return toolResult(result)
+        })
       },
     }
   }
@@ -384,8 +395,10 @@ export function apply(ctx) {
     try {
       const text = await snapshotOf(cwd)
       if (agent.id) snapshots.set(agent.id, text)
-    } catch {
-      /* snapshot is best-effort; tool still mounts */
+    } catch (error) {
+      // Snapshot is best-effort; the tool still mounts and the section reads the safe sync path.
+      operation({ plugin: 'dsh-claw-memory', feature: 'prompt', operation: 'memory_snapshot', agentId: agent.id })
+        .degraded(CODES.MEMORY_READ_FALLBACK_EMPTY, { reason: error && error.code ? String(error.code) : 'read_failed' })
     }
   })
 
@@ -440,7 +453,7 @@ export function apply(ctx) {
       const user = await loadVault(root, 'user')
       const memory = await loadVault(root, 'memory')
       const daily = await loadDaily(root)
-      const pending = await listPending(root)
+      const pending = await pendingOf(root)
       const settings = await loadSettings(settingsPath())
       return withTrace({ user, memory, daily, pending, settings })
     }),
