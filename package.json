@@ -1,8 +1,14 @@
 {
-  "name": "dsh-agent-memory",
-  "version": "0.1.10",
+  "name": "dsh-claw-memory",
+  "version": "0.3.0-rc.2",
   "description": "Claw persistent memory: vault, daily notes, review, flush. 完整留存：金库、日记、回顾、压缩前冲洗。",
-  "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "agent", "memory"],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent",
+    "memory"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "./host.js",
@@ -22,11 +28,23 @@
     "README.md",
     "LICENSE"
   ],
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "dsh-claw-core": "0.3.0-rc.2",
+    "dsh-claw-identity": "0.3.0-rc.2",
+    "dsh-claw-observability": "0.3.0-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "^0.2.0-rc.1"
   }
 }

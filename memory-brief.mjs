@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { isDsClawPath } from 'dsh-claw-identity/files'
 import { splitEntries } from './memory-entries.mjs'
+import { isInsideRoot } from './memory-store.mjs'
 import { scanMemoryText } from './memory-scan.mjs'
 
 export const BRIEF_LIMITS = {
@@ -49,9 +51,11 @@ export function loadMainBriefs(home) {
   for (const agent of Object.values((registry && registry.agents) || {})) {
     if (rows.length >= BRIEF_LIMITS.maxAgents) break
     if (!agent || agent.status === 'archived' || !agent.canonicalRoot) continue
+    if (!isDsClawPath(String(agent.canonicalRoot), home)) continue
+    const vault = join(agent.canonicalRoot, 'MEMORY.md')
     let memoryText = ''
     try {
-      memoryText = readFileSync(join(agent.canonicalRoot, 'MEMORY.md'), 'utf8')
+      if (isInsideRoot(agent.canonicalRoot, vault)) memoryText = readFileSync(vault, 'utf8')
     } catch { /* empty vault */ }
     rows.push({
       title: agent.title,

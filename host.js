@@ -1,12 +1,13 @@
 import { applyVaultOp, appendNote, defaultDshHome, listPending, loadDaily, loadDailySync, loadSettings, loadSettingsSync, loadVault, loadVaultSync, removePending, saveDaily, saveRawVault, saveSettings, settingsFile, writePending } from './memory-store.mjs'
-import { isDsClawPath } from '../dsh-agent-identity/identity-files.mjs'
-import { CODES, currentTraceId, operation, runWithTrace, setObserveHome } from '../dsh-observability/observe.mjs'
+import { isDsClawPath } from 'dsh-claw-identity/files'
+import { CODES, currentTraceId, operation, runWithTrace, setObserveHome } from 'dsh-claw-observability/observe'
+import { httpError, registerJsonRoute } from 'dsh-claw-core/http'
 import { renderFrozenPrompt } from './memory-prompt.mjs'
 import { loadMainBriefs, renderMainMemoryBrief } from './memory-brief.mjs'
 import { parseReviewJson, reviewSkipReason, reviewSystemPrompt, transcriptOf } from './memory-review.mjs'
 
-export const name = 'dsh-agent-memory'
-export const inject = ['tools', 'systemPrompt', 'webServer']
+export const name = 'dsh-claw-memory'
+export const inject = ['tools', 'systemPrompt', 'connection']
 
 function optionalService(ctx, key) {
   if (ctx && typeof ctx.get === 'function') {
@@ -18,8 +19,6 @@ function optionalService(ctx, key) {
   return undefined
 }
 
-const BODY_CAP = 65536
-const LOOPBACK_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/
 const REVIEW_TIMEOUT_MS = 12000
 const REVIEWED_CAP = 64
 
@@ -81,53 +80,20 @@ function mainBriefText() {
   return briefCache.text
 }
 
-const writeJson = (res, status, body) => {
+function withTrace(data) {
   const traceId = currentTraceId()
-  const payload = body && typeof body === 'object' && traceId && body.traceId == null
-    ? { ...body, traceId }
-    : body
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-  res.end(JSON.stringify(payload))
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return data
+  if (!traceId || data.traceId != null) return data
+  return { ...data, traceId }
 }
 
-const readJsonBody = (req, cap = BODY_CAP) => new Promise((resolveBody, reject) => {
-  let size = 0
-  const chunks = []
-  req.on('data', (chunk) => {
-    size += chunk.length
-    if (size > cap) {
-      reject(new Error('body too large'))
-      req.destroy()
-      return
-    }
-    chunks.push(chunk)
-  })
-  req.on('end', () => {
-    try {
-      resolveBody(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8')))
-    } catch {
-      reject(new Error('invalid json body'))
-    }
-  })
-  req.on('error', reject)
-})
+function reportSkippedPending(skip) {
+  operation({ plugin: 'dsh-claw-memory', feature: 'vault', operation: 'memory_pending_read' })
+    .degraded(CODES.MEMORY_READ_FAILED, { skipReason: 'corrupt_entry', reason: skip && skip.reason })
+}
 
-const guard = (req, res) => {
-  if (req.method !== 'POST') {
-    writeJson(res, 405, { ok: false, error: 'method not allowed' })
-    return false
-  }
-  const headers = req.headers || {}
-  if (headers['x-dsh-agent-memory'] !== '1') {
-    writeJson(res, 403, { ok: false, error: 'missing csrf header' })
-    return false
-  }
-  const origin = headers.origin
-  if (origin !== undefined && origin !== null && !LOOPBACK_ORIGIN.test(origin)) {
-    writeJson(res, 403, { ok: false, error: 'origin not allowed' })
-    return false
-  }
-  return true
+function pendingOf(root) {
+  return listPending(root, reportSkippedPending)
 }
 
 async function snapshotOf(root) {
@@ -176,7 +142,7 @@ async function runOp(root, op, settings) {
   const action = op.action
   const tracked = action === 'add' || action === 'replace' || action === 'remove' || action === 'approve' || action === 'reject' || action === 'save' || action === 'note'
   const obs = tracked
-    ? operation({ plugin: 'dsh-agent-memory', feature: 'vault', operation: 'memory_' + String(action || 'op') })
+    ? operation({ plugin: 'dsh-claw-memory', feature: 'vault', operation: 'memory_' + String(action || 'op') })
     : null
   if (obs) obs.start()
   try {
@@ -195,9 +161,9 @@ async function runOp(root, op, settings) {
       if (obs) saved && saved.ok === false ? obs.fail(CODES.MEMORY_WRITE_FAILED, saved.error) : obs.success()
       return saved
     }
-    if (action === 'pending') return { ok: true, pending: await listPending(root) }
+    if (action === 'pending') return { ok: true, pending: await pendingOf(root) }
     if (action === 'approve') {
-      const rows = await listPending(root)
+      const rows = await pendingOf(root)
       const row = rows.find((item) => item.id === op.id)
       if (!row) {
         if (obs) obs.reject(CODES.MEMORY_PENDING_NOT_FOUND)
@@ -250,7 +216,7 @@ export function apply(ctx) {
   }
 
   const stopPrompt = ctx.systemPrompt.section({
-    name: 'dsh-agent-memory',
+    name: 'dsh-claw-memory',
     order: 16,
     text: (assemble) => {
       const agent = assemble && assemble.agent
@@ -269,7 +235,7 @@ export function apply(ctx) {
   })
 
   const stopBrief = ctx.systemPrompt.section({
-    name: 'dsh-agent-memory-brief',
+    name: 'dsh-claw-memory-brief',
     order: 17,
     text() {
       return ''
@@ -302,17 +268,19 @@ export function apply(ctx) {
           return [{ type: 'text', text: JSON.stringify(value || {}, null, 2) }]
         },
       },
-      async execute(args, exec) {
-        const agent = exec && exec.agent
-        const cwd = cwdOf(agent) || root
-        if (!clawPath(cwd)) {
-          return toolResult({ ok: false, error: 'memory is only available to Claw agents' })
-        }
-        const settings = loadSettingsSync(settingsPath())
-        const result = await runOp(cwd, args || {}, settings)
-        const key = turnKey(agent, agent && agent.session) || sessionId
-        if (result && result.ok && key) called.add(key)
-        return toolResult(result)
+      execute(args, exec) {
+        return runWithTrace(exec, async () => {
+          const agent = exec && exec.agent
+          const cwd = cwdOf(agent) || root
+          if (!clawPath(cwd)) {
+            return toolResult({ ok: false, error: 'memory is only available to Claw agents' })
+          }
+          const settings = loadSettingsSync(settingsPath())
+          const result = await runOp(cwd, args || {}, settings)
+          const key = turnKey(agent, agent && agent.session) || sessionId
+          if (result && result.ok && key) called.add(key)
+          return toolResult(result)
+        })
       },
     }
   }
@@ -346,7 +314,7 @@ export function apply(ctx) {
     const text = transcriptOf(events)
     const key = turnKey(agent, session)
     const op = operation({
-      plugin: 'dsh-agent-memory',
+      plugin: 'dsh-claw-memory',
       feature: 'review',
       operation: opts.force ? 'compaction_flush' : 'turn_review',
       sessionId: session && session.id,
@@ -427,8 +395,10 @@ export function apply(ctx) {
     try {
       const text = await snapshotOf(cwd)
       if (agent.id) snapshots.set(agent.id, text)
-    } catch {
-      /* snapshot is best-effort; tool still mounts */
+    } catch (error) {
+      // Snapshot is best-effort; the tool still mounts and the section reads the safe sync path.
+      operation({ plugin: 'dsh-claw-memory', feature: 'prompt', operation: 'memory_snapshot', agentId: agent.id })
+        .degraded(CODES.MEMORY_READ_FALLBACK_EMPTY, { reason: error && error.code ? String(error.code) : 'read_failed' })
     }
   })
 
@@ -475,64 +445,49 @@ export function apply(ctx) {
     } catch { /* flush must never fail compaction */ }
   })
 
-  const handle = (fn) => async (req, res) => runWithTrace(req, async () => {
-    if (!guard(req, res)) return
-    try {
-      const body = await readJsonBody(req)
-      await fn(req, res, body)
-    } catch (error) {
-      writeJson(res, 400, { ok: false, error: String(error && error.message || error) })
-    }
+  registerJsonRoute(ctx, {
+    path: '/api/dsh-claw/memory/read',
+    handle: async (body, request) => runWithTrace(request, async () => {
+      const root = body && body.root
+      if (!clawPath(root)) throw httpError(400, 'invalid root')
+      const user = await loadVault(root, 'user')
+      const memory = await loadVault(root, 'memory')
+      const daily = await loadDaily(root)
+      const pending = await pendingOf(root)
+      const settings = await loadSettings(settingsPath())
+      return withTrace({ user, memory, daily, pending, settings })
+    }),
   })
 
-  const routes = [
-    ctx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-agent-memory/read',
-      handler: handle(async (_req, res, body) => {
-        const root = body && body.root
-        if (!clawPath(root)) {
-          writeJson(res, 400, { ok: false, error: 'invalid root' })
-          return
-        }
-        const user = await loadVault(root, 'user')
-        const memory = await loadVault(root, 'memory')
-        const daily = await loadDaily(root)
-        const pending = await listPending(root)
-        const settings = await loadSettings(settingsPath())
-        writeJson(res, 200, { ok: true, user, memory, daily, pending, settings })
-      }),
+  registerJsonRoute(ctx, {
+    path: '/api/dsh-claw/memory/write',
+    handle: async (body, request) => runWithTrace(request, async () => {
+      const root = body && body.root
+      if (!clawPath(root)) {
+        const op = operation({ plugin: 'dsh-claw-memory', feature: 'vault', operation: 'memory_write' })
+        op.start()
+        op.reject(CODES.MEMORY_ROOT_INVALID)
+        throw httpError(400, 'invalid root', CODES.MEMORY_ROOT_INVALID)
+      }
+      const settings = loadSettingsSync(settingsPath())
+      const result = await runOp(root, body || {}, settings)
+      if (!result || result.ok === false) {
+        throw httpError(400, (result && result.error) || 'bad request', result && result.code)
+      }
+      return withTrace(result)
     }),
-    ctx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-agent-memory/write',
-      handler: handle(async (_req, res, body) => {
-        const root = body && body.root
-        if (!clawPath(root)) {
-          const op = operation({ plugin: 'dsh-agent-memory', feature: 'vault', operation: 'memory_write' })
-          op.start()
-          op.reject(CODES.MEMORY_ROOT_INVALID)
-          writeJson(res, 400, { ok: false, error: 'invalid root', code: CODES.MEMORY_ROOT_INVALID })
-          return
-        }
-        const settings = loadSettingsSync(settingsPath())
-        const result = await runOp(root, body || {}, settings)
-        writeJson(res, result.ok ? 200 : 400, { ok: !!result.ok, ...result })
-      }),
+  })
+
+  registerJsonRoute(ctx, {
+    path: '/api/dsh-claw/memory/settings',
+    handle: async (body, request) => runWithTrace(request, async () => {
+      if (body && body.settings) {
+        const saved = await saveSettings(settingsPath(), body.settings)
+        return withTrace({ settings: saved })
+      }
+      return withTrace({ settings: await loadSettings(settingsPath()) })
     }),
-    ctx.webServer.register({
-      kind: 'exact',
-      path: '/dsh-agent-memory/settings',
-      handler: handle(async (_req, res, body) => {
-        if (body && body.settings) {
-          const saved = await saveSettings(settingsPath(), body.settings)
-          writeJson(res, 200, { ok: true, settings: saved })
-          return
-        }
-        writeJson(res, 200, { ok: true, settings: await loadSettings(settingsPath()) })
-      }),
-    }),
-  ]
+  })
 
   ctx.effect(() => () => {
     snapshots.clear()
@@ -544,8 +499,5 @@ export function apply(ctx) {
     if (typeof stopPre === 'function') stopPre()
     if (typeof stopStop === 'function') stopStop()
     if (typeof stopFlush === 'function') stopFlush()
-    for (const dispose of routes) {
-      if (typeof dispose === 'function') dispose()
-    }
   })
 }
